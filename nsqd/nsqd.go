@@ -63,8 +63,8 @@ type NSQD struct {
 
 	poolSize int
 
-	notifyChan           chan interface{}
-	optsNotificationChan chan struct{}
+	notifyChan           chan interface{} // 新增或删除topic和channel时，会写入notifyChan
+	optsNotificationChan chan struct{}    // 配置更改通知的channel
 	exitChan             chan int
 	waitGroup            util.WaitGroupWrapper
 
@@ -234,10 +234,12 @@ func (n *NSQD) Main() {
 	n.tcpListener = tcpListener
 	n.Unlock()
 	tcpServer := &tcpServer{ctx: ctx}
+	// tcp服务
 	n.waitGroup.Wrap(func() {
 		protocol.TCPServer(n.tcpListener, tcpServer, n.logf)
 	})
 
+	// https服务
 	if n.tlsConfig != nil && n.getOpts().HTTPSAddress != "" {
 		httpsListener, err = tls.Listen("tcp", n.getOpts().HTTPSAddress, n.tlsConfig)
 		if err != nil {
@@ -247,11 +249,13 @@ func (n *NSQD) Main() {
 		n.Lock()
 		n.httpsListener = httpsListener
 		n.Unlock()
+		// https和http都是用的newHTTPServer，因为https只是比http多了一个tls层，下面的逻辑是一样的
 		httpsServer := newHTTPServer(ctx, true, true)
 		n.waitGroup.Wrap(func() {
 			http_api.Serve(n.httpsListener, httpsServer, "HTTPS", n.logf)
 		})
 	}
+	// http服务
 	httpListener, err = net.Listen("tcp", n.getOpts().HTTPAddress)
 	if err != nil {
 		n.logf(LOG_FATAL, "listen (%s) failed - %s", n.getOpts().HTTPAddress, err)
@@ -265,20 +269,25 @@ func (n *NSQD) Main() {
 		http_api.Serve(n.httpListener, httpServer, "HTTP", n.logf)
 	})
 
+	// queueScan 扫描的是inflightQueue和deferredQueue这两个优先级队列
 	n.waitGroup.Wrap(func() { n.queueScanLoop() })
+	// lookupLoop处理与nsqlookupd的通信，将topic和channel信息注册到nsqlookupd等
 	n.waitGroup.Wrap(func() { n.lookupLoop() })
 	if n.getOpts().StatsdAddress != "" {
 		n.waitGroup.Wrap(func() { n.statsdLoop() })
 	}
 }
 
+// nsqd元数据结构体
+// 当nsqd进程退出时，将内存中的数据写入到磁盘
+// 当nsqd进程启动时，将磁盘中的数据读入到内存
 type meta struct {
 	Topics []struct {
 		Name     string `json:"name"`
-		Paused   bool   `json:"paused"`
+		Paused   bool   `json:"paused"` // topic状态
 		Channels []struct {
 			Name   string `json:"name"`
-			Paused bool   `json:"paused"`
+			Paused bool   `json:"paused"` // channel状态
 		} `json:"channels"`
 	} `json:"topics"`
 }
@@ -316,10 +325,13 @@ func writeSyncFile(fn string, data []byte) error {
 }
 
 func (n *NSQD) LoadMetadata() error {
+	// isLoading是一个flag
 	atomic.StoreInt32(&n.isLoading, 1)
 	defer atomic.StoreInt32(&n.isLoading, 0)
 
+	// 返回一个新文件路径，data-path/nsqd.dat
 	fn := newMetadataFile(n.getOpts())
+	// 也是返回一个文件路径，data-path/nsqd.$ID.data
 	// old metadata filename with ID, maintained in parallel to enable roll-back
 	fnID := oldMetadataFile(n.getOpts())
 
@@ -340,6 +352,8 @@ func (n *NSQD) LoadMetadata() error {
 			return fmt.Errorf("metadata in %s and %s do not match (delete one)", fn, fnID)
 		}
 	}
+
+	// 二者取其一，用metadata
 	if data == nil {
 		// only old metadata file exists, use it
 		fn = fnID
@@ -357,6 +371,7 @@ func (n *NSQD) LoadMetadata() error {
 			n.logf(LOG_WARN, "skipping creation of invalid topic %s", t.Name)
 			continue
 		}
+		// 没有就创建，并且还要从nsqlookupd去获取这个topic的channel name来创建channel
 		topic := n.GetTopic(t.Name)
 		if t.Paused {
 			topic.Pause()
@@ -376,17 +391,23 @@ func (n *NSQD) LoadMetadata() error {
 	return nil
 }
 
+// 将topic和channel信息写入磁盘
 func (n *NSQD) PersistMetadata() error {
 	// persist metadata about what topics/channels we have, across restarts
 	fileName := newMetadataFile(n.getOpts())
 	// old metadata filename with ID, maintained in parallel to enable roll-back
+	// fileNameID文件是fileName文件的软连接，内容和fileName一样，用于回滚操作。文件命名为nsqd.867.dat
+	// nsqd.867.dat这里的867是opts.ID，根据主机名的哈希值算出的0-1024之间的值
 	fileNameID := oldMetadataFile(n.getOpts())
 
 	n.logf(LOG_INFO, "NSQ: persisting topic/channel metadata to %s", fileName)
 
+	// 遍历所有的topic和channel。注：在调用PersistMetadata之前就加上了lock锁
+	// 拿到所有topic和channel的name和paused字段，paused描述该topic或channel的状态
 	js := make(map[string]interface{})
 	topics := []interface{}{}
 	for _, topic := range n.topicMap {
+		// 临时topic跳过不存
 		if topic.ephemeral {
 			continue
 		}
@@ -421,6 +442,9 @@ func (n *NSQD) PersistMetadata() error {
 
 	tmpFileName := fmt.Sprintf("%s.%d.tmp", fileName, rand.Int())
 
+	// 先写到临时文件，再rename。这样可以保证别的goroutine或外部进程对此文件的读写，传输是安全的。
+	// 而且即使此时程序挂掉，原来的文件还在。
+	// redis在进行备份时即如此：RDB会先写到临时文件，完了再Rename，这样外部程序对RDB文件的备份和传输过程是安全的。而且即使写新快照的过程中Server被强制关掉了，旧的RDB文件还在。
 	err = writeSyncFile(tmpFileName, data)
 	if err != nil {
 		return err
@@ -442,6 +466,7 @@ func (n *NSQD) PersistMetadata() error {
 	tmpFileNameID := fmt.Sprintf("%s.%d.tmp", fileNameID, rand.Int())
 
 	if runtime.GOOS != "windows" {
+		// 临时文件是一个符号链接（软链接）
 		err = os.Symlink(fileName, tmpFileNameID)
 	} else {
 		// on Windows need Administrator privs to Symlink
@@ -452,6 +477,7 @@ func (n *NSQD) PersistMetadata() error {
 		return err
 	}
 
+	// 最终生成的nsqd.733.dat是一个符号链接，指向nsqd.dat
 	err = os.Rename(tmpFileNameID, fileNameID)
 	if err != nil {
 		return err
@@ -504,6 +530,9 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 
 	n.Lock()
 
+	// 这里是一个双重检查加锁
+	// 为什么上面不加一个Lock，而是加一个读锁呢？考虑到GetTopic是常规操作，大多数情况下会命中数据而直接返回
+	// 用Lock的话有点浪费了。双重检查是防止在加读锁期间有goroutine修改了topicMap。
 	t, ok = n.topicMap[topicName]
 	if ok {
 		n.Unlock()
@@ -512,6 +541,7 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 	deleteCallback := func(t *Topic) {
 		n.DeleteExistingTopic(t.name)
 	}
+	// 创建了一个Topic，并启动goroutine将Topic上的msg写入到Topic下的所有channel中
 	t = NewTopic(topicName, &context{n}, deleteCallback)
 	n.topicMap[topicName] = t
 
@@ -522,10 +552,12 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 	t.Lock()
 	n.Unlock()
 
+	// 从nsqlookupd中取回topic下的channel并创建好，以使发送到topic的msg能被正确投递到channel
 	// if using lookupd, make a blocking call to get the topics, and immediately create them.
 	// this makes sure that any message received is buffered to the right channels
 	lookupdHTTPAddrs := n.lookupdHTTPAddrs()
 	if len(lookupdHTTPAddrs) > 0 {
+		// 返回的是去重排序后的channel names
 		channelNames, err := n.ci.GetLookupdTopicChannels(t.name, lookupdHTTPAddrs)
 		if err != nil {
 			n.logf(LOG_WARN, "failed to query nsqlookupd for channels to pre-create for topic %s - %s", t.name, err)
@@ -536,6 +568,7 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 				// because there isn't a client connected
 				continue
 			}
+			// 内部未加锁，这里用的还是topic的锁
 			t.getOrCreateChannel(channelName)
 		}
 	} else if len(n.getOpts().NSQLookupdTCPAddresses) > 0 {
@@ -645,13 +678,15 @@ func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, c
 	}
 	for {
 		if idealPoolSize == n.poolSize {
+			// 没有必要进行扩缩容
 			break
 		} else if idealPoolSize < n.poolSize {
-			// contract
+			// contract 收缩
 			closeCh <- 1
 			n.poolSize--
 		} else {
 			// expand
+			// 这个goroutine放在resizePool中来做，总觉得地方不合适
 			n.waitGroup.Wrap(func() {
 				n.queueScanWorker(workCh, responseCh, closeCh)
 			})
@@ -662,6 +697,7 @@ func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, c
 
 // queueScanWorker receives work (in the form of a channel) from queueScanLoop
 // and processes the deferred and in-flight queues
+// dirty表示确实有超时和延迟发送的消息存在
 func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, closeCh chan int) {
 	for {
 		select {
@@ -681,6 +717,7 @@ func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, close
 	}
 }
 
+// 处理正在投递中和延迟投递的消息
 // queueScanLoop runs in a single goroutine to process in-flight and deferred
 // priority queues. It manages a pool of queueScanWorker (configurable max of
 // QueueScanWorkerPoolMax (default: 4)) that process channels concurrently.

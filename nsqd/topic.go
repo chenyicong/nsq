@@ -41,6 +41,9 @@ type Topic struct {
 }
 
 // Topic constructor
+// 要往Topic发布消息，只需要将消息写到Topic.memoryMsgChan中，Topic创建成功后会开启一个
+// 新的goroutine(messagePump)来监听Topic.memoryMsgChan，当有新消息时会将消息复制N份发送
+// 到该Topic下的所有Channel中
 func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topic {
 	t := &Topic{
 		name:              topicName,
@@ -62,6 +65,7 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 			opts := ctx.nsqd.getOpts()
 			lg.Logf(opts.Logger, opts.logLevel, lg.LogLevel(level), f, args...)
 		}
+		// 创建DiskQueue：如果向Topic.memoryMsgChan写入消息但是memoryMsgChan已满时，nsq会将消息写到DiskQueue中
 		t.backend = diskqueue.New(
 			topicName,
 			ctx.nsqd.getOpts().DataPath,
@@ -74,8 +78,10 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 		)
 	}
 
+	// 新的goroutine来往该topic下的channel发送信息
 	t.waitGroup.Wrap(func() { t.messagePump() })
 
+	// 新建了一个topic，需要注册到nsqlookupd
 	t.ctx.nsqd.Notify(t)
 
 	return t
@@ -198,9 +204,13 @@ func (t *Topic) put(m *Message) error {
 	select {
 	case t.memoryMsgChan <- m:
 	default:
+		// memoryMsgChan已满
+		// 从buffer池中取出一个buffer，将消息写到buffer中，再将buffer写到topic.backend的wirteChan中
+		// buffer池是为了避免重复创建和销毁buffer对象
 		b := bufferPoolGet()
 		err := writeMessageToBackend(b, m, t.backend)
 		bufferPoolPut(b)
+		// 如果出错就更新错误值
 		t.ctx.nsqd.SetHealth(err)
 		if err != nil {
 			t.ctx.nsqd.logf(LOG_ERROR,
@@ -226,6 +236,19 @@ func (t *Topic) messagePump() {
 	var memoryMsgChan chan *Message
 	var backendChan chan []byte
 
+	/*
+			为什么这里要缓存chans，然后用channelUpdateChan来更新chans呢？
+			试想如果不这么做那就要将下面几行代码写到下面那个大的for循环(256行)中去，变成
+		    for {
+				t.RLock()
+				for _, c := range t.channelMaps {
+		        	...
+				}
+				t.RUnlock()
+		        ...
+		    }
+		    这个锁的范围太大，锁竞争很大，所以做了缓存并通过channel来更新
+	*/
 	t.RLock()
 	for _, c := range t.channelMap {
 		chans = append(chans, c)
@@ -238,15 +261,19 @@ func (t *Topic) messagePump() {
 	}
 
 	for {
+		// select随机选择case执行，所以这里不能保证先读完memoryMsgChan再读backendChan
+		// 本身memoryMsgChan和backendChan就没有先后关系，只是因为内存大小的限制而采取的策略，nsq不保证
+		// 消息的顺序
 		select {
 		case msg = <-memoryMsgChan:
 		case buf = <-backendChan:
-			msg, err = decodeMessage(buf)
+			msg, err = decodeMessage(buf) // 大端序
 			if err != nil {
 				t.ctx.nsqd.logf(LOG_ERROR, "failed to decode message - %s", err)
 				continue
 			}
 		case <-t.channelUpdateChan:
+			// 接收到channel变更的消息，刷新chans缓存
 			chans = chans[:0]
 			t.RLock()
 			for _, c := range t.channelMap {
@@ -254,6 +281,7 @@ func (t *Topic) messagePump() {
 			}
 			t.RUnlock()
 			if len(chans) == 0 || t.IsPaused() {
+				// 如果没有channel接受消息或者topic处于暂停状态，不要发送消息
 				memoryMsgChan = nil
 				backendChan = nil
 			} else {
@@ -262,6 +290,7 @@ func (t *Topic) messagePump() {
 			}
 			continue
 		case pause := <-t.pauseChan:
+			// 这里和上面更新chans的逻辑是一样的
 			if pause || len(chans) == 0 {
 				memoryMsgChan = nil
 				backendChan = nil
@@ -274,8 +303,11 @@ func (t *Topic) messagePump() {
 			goto exit
 		}
 
+		// 拿到了一条msg，准备复制给所有channel
 		for i, channel := range chans {
 			chanMsg := msg
+			// 为什么要是unique呢？
+			// message上还有Attempts，clientID，deferred等属性，这些属性在不同channel中是不同的，所以要复制
 			// copy the message because each channel
 			// needs a unique instance but...
 			// fastpath to avoid copy if its the first channel
@@ -286,6 +318,7 @@ func (t *Topic) messagePump() {
 				chanMsg.deferred = msg.deferred
 			}
 			if chanMsg.deferred != 0 {
+				// 延迟发送消息
 				channel.PutMessageDeferred(chanMsg, chanMsg.deferred)
 				continue
 			}

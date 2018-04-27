@@ -43,6 +43,7 @@ func New(opts *Options) *NSQLookupd {
 }
 
 func (l *NSQLookupd) Main() {
+	// 为啥没有用context.Context呢?
 	ctx := &Context{l}
 
 	tcpListener, err := net.Listen("tcp", l.opts.TCPAddress)

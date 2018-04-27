@@ -29,6 +29,7 @@ func (p *tcpServer) Handle(clientConn net.Conn) {
 	p.ctx.nsqlookupd.logf(LOG_INFO, "CLIENT(%s): desired protocol magic '%s'",
 		clientConn.RemoteAddr(), protocolMagic)
 
+	// 目前只支持V1
 	var prot protocol.Protocol
 	switch protocolMagic {
 	case "  V1":

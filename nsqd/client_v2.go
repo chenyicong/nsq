@@ -109,6 +109,7 @@ type clientV2 struct {
 func newClientV2(id int64, conn net.Conn, ctx *context) *clientV2 {
 	var identifier string
 	if conn != nil {
+		// use host as identifier
 		identifier, _, _ = net.SplitHostPort(conn.RemoteAddr().String())
 	}
 

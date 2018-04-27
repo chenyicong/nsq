@@ -197,6 +197,7 @@ func (p *program) Init(env svc.Environment) error {
 }
 
 func (p *program) Start() error {
+	// 在这里给opts.ID赋默认值
 	opts := nsqd.NewOptions()
 
 	flagSet := nsqdFlagSet(opts)
@@ -219,13 +220,16 @@ func (p *program) Start() error {
 	}
 	cfg.Validate()
 
+	// 合并命令行和配置文件中的配置
 	options.Resolve(opts, flagSet, cfg)
 	nsqd := nsqd.New(opts)
 
+	// 创建topic和channel
 	err := nsqd.LoadMetadata()
 	if err != nil {
 		log.Fatalf("ERROR: %s", err.Error())
 	}
+	// 为什么上面刚读完现在又要写呢？因为上面不止是从文件中获取了topic和channel信息，也从nsqlookupd获取了信息，所以可能是有更新的
 	err = nsqd.PersistMetadata()
 	if err != nil {
 		log.Fatalf("ERROR: failed to persist metadata - %s", err.Error())

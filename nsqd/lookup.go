@@ -26,6 +26,7 @@ func connectCallback(n *NSQD, hostname string, syncTopicChan chan *lookupPeer) f
 			lp.Close()
 			return
 		}
+		// 执行Identify
 		resp, err := lp.Command(cmd)
 		if err != nil {
 			n.logf(LOG_ERROR, "LOOKUPD(%s): %s - %s", lp, cmd, err)
@@ -66,21 +67,26 @@ func (n *NSQD) lookupLoop() {
 	ticker := time.Tick(15 * time.Second)
 	for {
 		if connect {
+			// 配置文件中或启动命令中指定的nsqlookupd服务的地址
 			for _, host := range n.getOpts().NSQLookupdTCPAddresses {
+				// 已经连接过了，跳过
 				if in(host, lookupAddrs) {
 					continue
 				}
 				n.logf(LOG_INFO, "LOOKUP(%s): adding peer", host)
 				lookupPeer := newLookupPeer(host, n.getOpts().MaxBodySize, n.logf,
 					connectCallback(n, hostname, syncTopicChan))
+				// 连接之后会调用connectCallback，里面还有大段逻辑
 				lookupPeer.Command(nil) // start the connection
 				lookupPeers = append(lookupPeers, lookupPeer)
 				lookupAddrs = append(lookupAddrs, host)
 			}
+			// lookupPeers是一个atomic.Value
 			n.lookupPeers.Store(lookupPeers)
 			connect = false
 		}
 
+		// 上面已经和所有nsqlookupd建立了连接，之后每隔15s ping一下
 		select {
 		case <-ticker:
 			// send a heartbeat and read a response (read detects closed conns)
@@ -92,6 +98,8 @@ func (n *NSQD) lookupLoop() {
 					n.logf(LOG_ERROR, "LOOKUPD(%s): %s - %s", lookupPeer, cmd, err)
 				}
 			}
+		// 当新增或删除topic和channel时，会写入notifyChan，这里就会感知到，然后向nsqlookupd发送消息
+		// 具体是新增还是删除，靠topic和channel上的exitFlag来判断
 		case val := <-n.notifyChan:
 			var cmd *nsq.Command
 			var branch string
@@ -101,6 +109,7 @@ func (n *NSQD) lookupLoop() {
 				// notify all nsqlookupds that a new channel exists, or that it's removed
 				branch = "channel"
 				channel := val.(*Channel)
+				// 对于channel的操作，也要带上topic信息
 				if channel.Exiting() == true {
 					cmd = nsq.UnRegister(channel.topicName, channel.name)
 				} else {
@@ -125,6 +134,7 @@ func (n *NSQD) lookupLoop() {
 				}
 			}
 		case lookupPeer := <-syncTopicChan:
+			// 将topic、channel注册到新的nsqlookupd服务中
 			var commands []*nsq.Command
 			// build all the commands first so we exit the lock(s) as fast as possible
 			n.RLock()
@@ -150,6 +160,7 @@ func (n *NSQD) lookupLoop() {
 				}
 			}
 		case <-n.optsNotificationChan:
+			// 添加或减少nsqlookupd服务
 			var tmpPeers []*lookupPeer
 			var tmpAddrs []string
 			for _, lp := range lookupPeers {
@@ -159,6 +170,7 @@ func (n *NSQD) lookupLoop() {
 					continue
 				}
 				n.logf(LOG_INFO, "LOOKUP(%s): removing peer", lp)
+				// 如果旧的lookupd地址不在新的配置中，那么close
 				lp.Close()
 			}
 			lookupPeers = tmpPeers

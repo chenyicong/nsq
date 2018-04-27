@@ -12,6 +12,12 @@
   revision = "a3a6125de9329587178a9792dc8f4bc98e620d2d"
 
 [[projects]]
+  name = "github.com/bitly/go-nsq"
+  packages = ["."]
+  revision = "eee57a3ac4174c55924125bb15eeeda8cffb6e6f"
+  version = "v1.0.7"
+
+[[projects]]
   name = "github.com/bitly/timer_metrics"
   packages = ["."]
   revision = "afad1794bb13e2a094720aeb27c088aa64564895"
@@ -59,12 +65,15 @@
 [[projects]]
   branch = "master"
   name = "golang.org/x/sys"
-  packages = ["unix","windows","windows/svc"]
+  packages = [
+    "windows",
+    "windows/svc"
+  ]
   revision = "661970f62f5897bc0cd5fdca7e087ba8a98a8fa1"
 
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "532ea1365ba72d95b44f494d7a4c77046f7786c7c1a706faadf3c5202da0b47e"
+  inputs-digest = "cd775d884c0461741f4bf8a4b403829369444b0cfa26354701702d392d900f68"
   solver-name = "gps-cdcl"
   solver-version = 1

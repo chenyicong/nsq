@@ -33,6 +33,7 @@ type protocolV2 struct {
 	ctx *context
 }
 
+// nsqd TCP hanlder 的具体实现
 func (p *protocolV2) IOLoop(conn net.Conn) error {
 	var err error
 	var line []byte
@@ -47,18 +48,32 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	// and avoid a potential race with IDENTIFY (where a client
 	// could have changed or disabled said attributes)
 	messagePumpStartedChan := make(chan bool)
+	// 从channel的memoryMsgChan读取消息发送给client
 	go p.messagePump(client, messagePumpStartedChan)
 	<-messagePumpStartedChan
 
+	// 这个可以看成是另一个goroutine（相对于上面的messagePump）：
+	// 定时发送心跳信息，客户端收到心跳信息后要回复。
+	// 如果nsqd长时间未收到该连接的心跳回复说明连接已出问题，会断开连接，这就是nsq的心跳实现机制
 	for {
 		if client.HeartbeatInterval > 0 {
-			client.SetReadDeadline(time.Now().Add(client.HeartbeatInterval * 2))
+			// 如果超过client.HeartbeatInterval * 2时间间隔内未收到客户端发送的命令，说明连接出问题了，需要关闭此链接。
+			// 正常情况下每隔HeartbeatInterval时间客户端都会发送一个心跳回复。
+			client.SetReadDeadline(time.Now().Add(client.HeartbeatInterval * 2)) // 下一次读操作应该发生在 HeartbeatInterval * 2 时间内
 		} else {
 			client.SetReadDeadline(zeroTime)
 		}
 
 		// ReadSlice does not allocate new space for the data each request
 		// ie. the returned slice is only valid until the next call to it
+		// 补充：
+		// To reduce socket IO syscalls, client net.Conn are wrapped with bufio.Reader and bufio.Writer.
+		// The Reader exposes ReadSlice(), which reuses its internal buffer.
+		// This nearly eliminates allocations while reading off the socket, greatly reducing GC pressure.
+		// This is possible because the data associated with most commands does not escape (
+		// in the edge cases where this is not true, the data is explicitly copied).
+		//
+		// nsq规定所有名利以"\n"结尾，命令与参数之间以空格分隔
 		line, err = client.Reader.ReadSlice('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -75,11 +90,13 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
+		// params[0]为命令的类型，params[1:]为命令参数
 		params := bytes.Split(line, separatorBytes)
 
 		p.ctx.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): [%s] %s", client, params)
 
 		var response []byte
+		// 处理客户端发送过来的命令
 		response, err = p.Exec(client, params)
 		if err != nil {
 			ctx := ""
@@ -101,6 +118,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 			continue
 		}
 
+		// 将命令的处理结果发送给客户端
 		if response != nil {
 			err = p.Send(client, frameTypeResponse, response)
 			if err != nil {
@@ -111,8 +129,10 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	}
 
 	p.ctx.nsqd.logf(LOG_INFO, "PROTOCOL(V2): [%s] exiting ioloop", client)
+	// 连接出问题了，需要关闭
 	conn.Close()
 	close(client.ExitChan)
+	// client.Channel记录的是该客户端订阅的Channel,客户端关闭的时候需要从Channel中移除这个订阅者。
 	if client.Channel != nil {
 		client.Channel.RemoveClient(client.ID)
 	}
@@ -171,23 +191,27 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 		return nil, err
 	}
 	switch {
-	case bytes.Equal(params[0], []byte("FIN")):
+	case bytes.Equal(params[0], []byte("FIN")): // 完成一个消息（表示处理成功）
+		// FIN <message_id>\n
 		return p.FIN(client, params)
-	case bytes.Equal(params[0], []byte("RDY")):
+	case bytes.Equal(params[0], []byte("RDY")): // 更新 RDY 状态 (表示客户端已经准备好接收N 消息)
+		// RDY <count>\n
 		return p.RDY(client, params)
 	case bytes.Equal(params[0], []byte("REQ")):
 		return p.REQ(client, params)
-	case bytes.Equal(params[0], []byte("PUB")):
+	case bytes.Equal(params[0], []byte("PUB")): // 发布一个消息到Topic
+		// PUB <topic_name>\n [ 四字节消息的大小 ][ 消息的内容 ]
 		return p.PUB(client, params)
 	case bytes.Equal(params[0], []byte("MPUB")):
 		return p.MPUB(client, params)
 	case bytes.Equal(params[0], []byte("DPUB")):
 		return p.DPUB(client, params)
-	case bytes.Equal(params[0], []byte("NOP")):
+	case bytes.Equal(params[0], []byte("NOP")): // 心跳回复，没有实际意义
 		return p.NOP(client, params)
 	case bytes.Equal(params[0], []byte("TOUCH")):
 		return p.TOUCH(client, params)
-	case bytes.Equal(params[0], []byte("SUB")):
+	case bytes.Equal(params[0], []byte("SUB")): // 订阅Topic/Channel
+		// SUB <topic_name> <channel_name>\n
 		return p.SUB(client, params)
 	case bytes.Equal(params[0], []byte("CLS")):
 		return p.CLS(client, params)
@@ -197,6 +221,34 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, protocol.NewFatalClientErr(nil, "E_INVALID", fmt.Sprintf("invalid command %s", params[0]))
 }
 
+/*
+虽然这个方法不在channel上，但实际上是在监听channel的memoryMsgChan
+channel没有自己的messagePump方法
+
+一个Message的推送, 经过了 两个chan 队列:
+1. topic.memoryMsgChan
+2. channel.memoryMsgChan
+
+两个队列的两头(读, 写), 分别有一个goroutine进行, 也就是3个goroutine:
+1. protocol.IOLoop(clientConn)
+2. topic.messagePump()
+3. protocol.messagePump()
+
+message数据流
+----------
+ClientConn
+    |
+topic.memoryMsgChan: protocol.IOLoop(clientConn) topic.memoryMsgChan
+    |
+channel.memoryMsgChan: topic.messagePump() channel.memoryMsgChan
+    |
+ClientConn: protocol.messagePump()
+----------
+
+channel可以被多个client订阅，也就是一个channel.memoryMsgChan会被多个client的messagePump方法进行读取，
+但因为chan的特性, 一条缓存在channel.memoryMsgChan中的消息, 只会被一个client读取到
+这也就是针对client的负载均衡
+*/
 func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var err error
 	var memoryMsgChan chan *Message
@@ -208,6 +260,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var flusherChan <-chan time.Time
 	var sampleRate int32
 
+	// subscribe
 	subEventChan := client.SubEventChan
 	identifyEventChan := client.IdentifyEventChan
 	outputBufferTicker := time.NewTicker(client.OutputBufferTimeout)
@@ -228,6 +281,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	close(startedChan)
 
 	for {
+		// IsReadyForMessages就是检查Client的RDY命令所设置的ReadyCount，判断是否可以继续向Client发送消息
 		if subChannel == nil || !client.IsReadyForMessages() {
 			// the client is not ready to receive messages...
 			memoryMsgChan = nil
@@ -255,6 +309,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			flusherChan = outputBufferTicker.C
 		}
 
+		// 执行针对client的各种事件
 		select {
 		case <-flusherChan:
 			// if this case wins, we're either starved
@@ -267,9 +322,13 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 				goto exit
 			}
 			flushed = true
+		//接收到客户端发送的RDY命令后，则会向ReadyStateChan中写入消息，重新进入for循环
 		case <-client.ReadyStateChan:
 		case subChannel = <-subEventChan:
 			// you can't SUB anymore
+			// 接收到客户端发送的SUB命令后，会向subEventChan中写入信息
+			// subEventChan则被置为nil(读写一个nil channel均会block)，所以一个client只能订阅一个Channel
+			// 这里的一个client对应的是一个consumer，一台机器上可以起多个consumer来subscribe Topic
 			subEventChan = nil
 		case identifyData := <-identifyEventChan:
 			// you can't IDENTIFY anymore
@@ -292,6 +351,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			}
 
 			msgTimeout = identifyData.MsgTimeout
+		// 发送心跳消息
 		case <-heartbeatChan:
 			err = p.Send(client, frameTypeResponse, heartbeatBytes)
 			if err != nil {
@@ -322,8 +382,18 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			}
 			msg.Attempts++
 
+			// 出于可靠性考虑，将消息发送到subscriber后并不真正将消息删除，
+			// 而是设置过期时间后，将消息缓存起来
+			//
+			// 以消息的发送时间排序，将消息放在一个最小时间堆上，
+			// 如果在规定时间内收到对该消息的确认回复(FIN messageId),
+			// 说明消息已被消费者成功处理，会将该消息从堆中删除
+			// 如果超过一定时间没有接受 FIN messageId，会从堆中取出该消息重新发送，
+			// 所以nsq能确保一个消息至少被一个消费者处理。
 			subChannel.StartInFlightTimeout(msg, client.ID, msgTimeout)
+			// 增加计数器，并不是发消息
 			client.SendingMessage()
+			// 发消息
 			err = p.SendMessage(client, msg)
 			if err != nil {
 				goto exit
@@ -613,6 +683,7 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	for {
 		topic := p.ctx.nsqd.GetTopic(topicName)
 		channel = topic.GetChannel(channelName)
+		// 将client和channel建立关系
 		channel.AddClient(client.ID, client)
 
 		if (channel.ephemeral && channel.Exiting()) || (topic.ephemeral && topic.Exiting()) {
@@ -761,12 +832,14 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "PUB insufficient number of parameters")
 	}
 
+	// 校验topic name
 	topicName := string(params[1])
 	if !protocol.IsValidTopicName(topicName) {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
 			fmt.Sprintf("PUB topic name %q is not valid", topicName))
 	}
 
+	// 消息体长度，由前4个字节决定
 	bodyLen, err := readLen(client.Reader, client.lenSlice)
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "PUB failed to read message body size")
@@ -777,6 +850,8 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 			fmt.Sprintf("PUB invalid message body size %d", bodyLen))
 	}
 
+	// 默认最大值是 1024 * 1024 byte，也就是1M
+	// 但是理论上讲 应该能支持到 2^32 - 1 bit， 也就是16M差1bit
 	if int64(bodyLen) > p.ctx.nsqd.getOpts().MaxMsgSize {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
 			fmt.Sprintf("PUB message too big %d > %d", bodyLen, p.ctx.nsqd.getOpts().MaxMsgSize))
@@ -788,11 +863,13 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "PUB failed to read message body")
 	}
 
+	// client是否有权限对这个topic做PUB操作
 	if err := p.CheckAuth(client, "PUB", topicName, ""); err != nil {
 		return nil, err
 	}
 
 	topic := p.ctx.nsqd.GetTopic(topicName)
+	// 创建message，topic带了一个全局ID生成器, snowflake
 	msg := NewMessage(topic.GenerateID(), messageBody)
 	err = topic.PutMessage(msg)
 	if err != nil {

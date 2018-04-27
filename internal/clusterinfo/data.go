@@ -157,6 +157,7 @@ func (c *ClusterInfo) GetLookupdTopicChannels(topic string, lookupdHTTPAddrs []s
 		return nil, fmt.Errorf("Failed to query any nsqlookupd: %s", ErrList(errs))
 	}
 
+	// 去重
 	channels = stringy.Uniq(channels)
 	sort.Strings(channels)
 

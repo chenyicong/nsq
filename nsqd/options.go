@@ -107,8 +107,8 @@ func NewOptions() *Options {
 		HTTPClientConnectTimeout: 2 * time.Second,
 		HTTPClientRequestTimeout: 5 * time.Second,
 
-		MemQueueSize:    10000,
-		MaxBytesPerFile: 100 * 1024 * 1024,
+		MemQueueSize:    10000,             // 每个queue在内存中最多能放多少条数据
+		MaxBytesPerFile: 100 * 1024 * 1024, // 消息持久化的磁盘文件的大小
 		SyncEvery:       2500,
 		SyncTimeout:     2 * time.Second,
 

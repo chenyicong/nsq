@@ -121,6 +121,7 @@ func (p *LookupProtocolV1) REGISTER(client *ClientV1, reader *bufio.Reader, para
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "client must IDENTIFY")
 	}
 
+	// 获取Topic和Chan的名字
 	topic, channel, err := getTopicChan("REGISTER", params)
 	if err != nil {
 		return nil, err

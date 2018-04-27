@@ -98,7 +98,9 @@ func (lp *lookupPeer) Command(cmd *nsq.Command) ([]byte, error) {
 			return nil, err
 		}
 		lp.state = stateConnected
+		// 发送"  V1"(前面两个空格)
 		lp.Write(nsq.MagicV1)
+		// 如果初始状态是未连接，identify一下
 		if initialState == stateDisconnected {
 			lp.connectCallback(lp)
 		}

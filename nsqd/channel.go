@@ -82,6 +82,7 @@ func NewChannel(topicName string, channelName string, ctx *context,
 		deleteCallback: deleteCallback,
 		ctx:            ctx,
 	}
+	// E2EProcessingLatencyPercentiles主要用于统计消息投递的延迟
 	if len(ctx.nsqd.getOpts().E2EProcessingLatencyPercentiles) > 0 {
 		c.e2eProcessingLatencyStream = quantile.New(
 			ctx.nsqd.getOpts().E2EProcessingLatencyWindowTime,
@@ -89,6 +90,7 @@ func NewChannel(topicName string, channelName string, ctx *context,
 		)
 	}
 
+	// 初始化inflightPQ和deferredPQ
 	c.initPQ()
 
 	if strings.HasSuffix(channelName, "#ephemeral") {
@@ -353,6 +355,7 @@ func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 	}
 	c.removeFromInFlightPQ(msg)
 	if c.e2eProcessingLatencyStream != nil {
+		// 统计延迟，time.Now().UnixNano() - msg.TimeStamp
 		c.e2eProcessingLatencyStream.Insert(msg.Timestamp)
 	}
 	return nil
@@ -425,10 +428,16 @@ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout tim
 	if err != nil {
 		return err
 	}
+	// 放入小根堆中
 	c.addToInFlightPQ(msg)
 	return nil
 }
 
+// 延迟投递
+// 首先计算延迟投递的时间点，然后调用pushDeferredMessage将消息加入deferredMessages字典，最后将消息放入
+// deferredPQ队列。
+// 延迟投递的消息会被专门的worker扫描并在延迟投递的时间点进行投递。需要注意的是，立即重新投递的消息不会
+// 进入deferredPQ队列。
 func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
 	absTs := time.Now().Add(timeout).UnixNano()
 	item := &pqueue.Item{Value: msg, Priority: absTs}
@@ -483,6 +492,7 @@ func (c *Channel) removeFromInFlightPQ(msg *Message) {
 		c.inFlightMutex.Unlock()
 		return
 	}
+	// 从堆中删除msg
 	c.inFlightPQ.Remove(msg.index)
 	c.inFlightMutex.Unlock()
 }
@@ -516,6 +526,7 @@ func (c *Channel) popDeferredMessage(id MessageID) (*pqueue.Item, error) {
 
 func (c *Channel) addToDeferredPQ(item *pqueue.Item) {
 	c.deferredMutex.Lock()
+	// DeferredPQ这个优先级队列是用小根堆来实现的
 	heap.Push(&c.deferredPQ, item)
 	c.deferredMutex.Unlock()
 }
@@ -531,6 +542,7 @@ func (c *Channel) processDeferredQueue(t int64) bool {
 	dirty := false
 	for {
 		c.deferredMutex.Lock()
+		// 小根堆，item != nil说明有需要现在投递的消息
 		item, _ := c.deferredPQ.PeekAndShift(t)
 		c.deferredMutex.Unlock()
 
@@ -565,22 +577,28 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 		msg, _ := c.inFlightPQ.PeekAndShift(t)
 		c.inFlightMutex.Unlock()
 
+		// msg != nil，说明有一条发送中的消息超时了
 		if msg == nil {
 			goto exit
 		}
 		dirty = true
 
+		// 从in-flight dictionary中移除这条msg
 		_, err := c.popInFlightMessage(msg.clientID, msg.ID)
 		if err != nil {
 			goto exit
 		}
+		// 增加timeout计数器
 		atomic.AddUint64(&c.timeoutCount, 1)
 		c.RLock()
 		client, ok := c.clients[msg.clientID]
 		c.RUnlock()
 		if ok {
+			// 首先减少了client的inflightCount计数器
+			// 然后向ReadyStateChan中写入值，以使messagePump中的for循环再次执行，向client推送这条消息
 			client.TimedOutMessage()
 		}
+		// 将msg重新塞到channel中
 		c.put(msg)
 	}
 

@@ -48,10 +48,17 @@ func NewGUIDFactory(nodeID int64) *guidFactory {
 	}
 }
 
+/*
+	最高1bit不用（二进制中最高位为1的都是负数，但是我们生成的id一般都使用整数，所以这个最高位固定是0），
+	默认情况下41bit的时间戳可以支持该算法使用到2082年，
+	10bit的工作机器id可以支持1023台机器，
+	序列号支持1毫秒产生4095个自增序列id
+*/
 func (f *guidFactory) NewGUID() (guid, error) {
 	f.Lock()
 
 	// divide by 1048576, giving pseudo-milliseconds
+	// 1 ts = nano >> 20，而1 milliseconds = 1000000 nano，所以注释里说milliseconds
 	ts := time.Now().UnixNano() >> 20
 
 	if ts < f.lastTimestamp {

@@ -49,3 +49,12 @@ profile
 
 # vim stuff
 *.sw[op]
+
+Procfile
+apps/*
+build/*
+consumer.go
+cpu.pprof
+internal/util/util_test.go
+producer.go
+vendor/*
