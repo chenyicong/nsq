@@ -67,6 +67,14 @@ func ParseLogLevel(levelstr string, verbose bool) (LogLevel, error) {
 	return lvl, nil
 }
 
+// 为什么calldepth是3
+// calldepth是打印时获取的堆栈信息，在这里
+// 0表示标准库log.go中159行的runtime.Caller
+// 1表示这里，也就是Logf函数
+// 2表示调用Logf函数的函数，也就是比如nsqd/logger.go中的logf方法
+// 3表示的是调用logf的函数，也就是真实地在打印的地方
+// 因为项目中打印都是调用的统一的logf方法，所以可以全部设置成3
+// 参考：http://www.flysnow.org/2017/05/06/go-in-action-go-log.html
 func Logf(logger Logger, cfgLevel LogLevel, msgLevel LogLevel, f string, args ...interface{}) {
 	if cfgLevel > msgLevel {
 		return

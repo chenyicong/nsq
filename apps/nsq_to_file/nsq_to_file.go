@@ -1,4 +1,5 @@
 // This is a client that writes out to a file, and optionally rolls the file
+// 简易客户端，接收topic下的消息存储在文件中
 
 package main
 

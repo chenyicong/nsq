@@ -1067,6 +1067,8 @@ func getMessageID(p []byte) (*MessageID, error) {
 	if len(p) != MsgIDLength {
 		return nil, errors.New("Invalid Message ID")
 	}
+	// &p[0]拿到的就是&p
+	// slice的地址是slice第一个元素的地址
 	return (*MessageID)(unsafe.Pointer(&p[0])), nil
 }
 
