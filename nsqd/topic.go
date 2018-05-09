@@ -22,13 +22,13 @@ type Topic struct {
 
 	name              string
 	channelMap        map[string]*Channel
-	backend           BackendQueue
+	backend           BackendQueue // 如果memoryMsgChan已满，将消息写到DiskQueue
 	memoryMsgChan     chan *Message
 	exitChan          chan int
-	channelUpdateChan chan int
+	channelUpdateChan chan int // 当有新的channel注册到topic，会写此chan发通知
 	waitGroup         util.WaitGroupWrapper
 	exitFlag          int32
-	idFactory         *guidFactory
+	idFactory         *guidFactory // 使用snowflake算法生成全局唯一ID，作为message的ID
 
 	ephemeral      bool
 	deleteCallback func(*Topic)

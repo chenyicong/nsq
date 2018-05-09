@@ -39,6 +39,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 	var line []byte
 	var zeroTime time.Time
 
+	// atomic而不是加锁，借助atomic的硬件支持使操作更轻量
 	clientID := atomic.AddInt64(&p.ctx.nsqd.clientIDSequence, 1)
 	client := newClientV2(clientID, conn, p.ctx)
 
@@ -73,7 +74,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 		// This is possible because the data associated with most commands does not escape (
 		// in the edge cases where this is not true, the data is explicitly copied).
 		//
-		// nsq规定所有名利以"\n"结尾，命令与参数之间以空格分隔
+		// nsq规定所有命令以"\n"结尾，命令与参数之间以空格分隔
 		line, err = client.Reader.ReadSlice('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -238,10 +239,13 @@ message数据流
 ----------
 ClientConn
     |
+	V
 topic.memoryMsgChan: protocol.IOLoop(clientConn) topic.memoryMsgChan
     |
+	V
 channel.memoryMsgChan: topic.messagePump() channel.memoryMsgChan
     |
+	V
 ClientConn: protocol.messagePump()
 ----------
 
@@ -358,6 +362,8 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 				goto exit
 			}
 		case b := <-backendMsgChan:
+			// 将backendMsgChan和memoryMsgChan放在一个select中更加重了nsq消息的无序
+			// 当然不是说不放在一个select中就能保证有序，要保证消息有序需要额外的很多工作
 			if sampleRate > 0 && rand.Int31n(100) > sampleRate {
 				continue
 			}

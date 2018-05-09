@@ -269,9 +269,7 @@ func (n *NSQD) Main() {
 		http_api.Serve(n.httpListener, httpServer, "HTTP", n.logf)
 	})
 
-	// queueScan 扫描的是inflightQueue和deferredQueue这两个优先级队列
 	n.waitGroup.Wrap(func() { n.queueScanLoop() })
-	// lookupLoop处理与nsqlookupd的通信，将topic和channel信息注册到nsqlookupd等
 	n.waitGroup.Wrap(func() { n.lookupLoop() })
 	if n.getOpts().StatsdAddress != "" {
 		n.waitGroup.Wrap(func() { n.statsdLoop() })
@@ -307,6 +305,7 @@ func readOrEmpty(fn string) ([]byte, error) {
 			return nil, fmt.Errorf("failed to read metadata from %s - %s", fn, err)
 		}
 	}
+	// 如果文件不存在，data=nil
 	return data, nil
 }
 
@@ -344,16 +343,18 @@ func (n *NSQD) LoadMetadata() error {
 		return errID
 	}
 
+	// newMetadataFile和oldMetadataFile均不存在
 	if data == nil && dataID == nil {
 		return nil // fresh start
 	}
+
+	// 如果两个meta文件均存在，那他们的值应该是一样的
 	if data != nil && dataID != nil {
 		if bytes.Compare(data, dataID) != 0 {
 			return fmt.Errorf("metadata in %s and %s do not match (delete one)", fn, fnID)
 		}
 	}
 
-	// 二者取其一，用metadata
 	if data == nil {
 		// only old metadata file exists, use it
 		fn = fnID
@@ -377,6 +378,7 @@ func (n *NSQD) LoadMetadata() error {
 			topic.Pause()
 		}
 
+		// 遍历metafile中记录的topic的channel，不存在则创建，同时标记状态是否是pause
 		for _, c := range t.Channels {
 			if !protocol.IsValidChannelName(c.Name) {
 				n.logf(LOG_WARN, "skipping creation of invalid channel %s", c.Name)
@@ -718,6 +720,8 @@ func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, close
 }
 
 // 处理正在投递中和延迟投递的消息
+// queueScan 扫描的是inflightQueue和deferredQueue这两个优先级队列
+//
 // queueScanLoop runs in a single goroutine to process in-flight and deferred
 // priority queues. It manages a pool of queueScanWorker (configurable max of
 // QueueScanWorkerPoolMax (default: 4)) that process channels concurrently.

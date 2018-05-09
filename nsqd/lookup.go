@@ -51,6 +51,7 @@ func connectCallback(n *NSQD, hostname string, syncTopicChan chan *lookupPeer) f
 	}
 }
 
+// lookupLoop处理与nsqlookupd的通信，将topic和channel信息注册到nsqlookupd等
 func (n *NSQD) lookupLoop() {
 	var lookupPeers []*lookupPeer
 	var lookupAddrs []string

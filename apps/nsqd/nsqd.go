@@ -205,6 +205,7 @@ func (p *program) Start() error {
 
 	rand.Seed(time.Now().UTC().UnixNano())
 
+	// 参数在flagSet中
 	if flagSet.Lookup("version").Value.(flag.Getter).Get().(bool) {
 		fmt.Println(version.String("nsqd"))
 		os.Exit(0)
